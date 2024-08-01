@@ -551,6 +551,10 @@ namespace Menu {
 				"Custom gpu5 model name in gpu stats box.",
 				"",
 				"Empty string to disable."},
+			{"intel_gpu_exporter",
+				"HTTP endpoint to pull Intel GPU metrics from.",
+				"",
+				"Empty string to disable."},
 		},
 	#endif
 		{
