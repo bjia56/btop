@@ -216,6 +216,8 @@ namespace Config {
 		{"custom_gpu_name3",	"#* Custom gpu3 model name, empty string to disable."},
 		{"custom_gpu_name4",	"#* Custom gpu4 model name, empty string to disable."},
 		{"custom_gpu_name5",	"#* Custom gpu5 model name, empty string to disable."},
+
+		{"intel_gpu_exporter", "#* HTTP endpoint to pull Intel GPU metrics from, if Intel PMU is not available."},
 	#endif
 	};
 
@@ -252,7 +254,8 @@ namespace Config {
 		{"custom_gpu_name3", ""},
 		{"custom_gpu_name4", ""},
 		{"custom_gpu_name5", ""},
-		{"show_gpu_info", "Auto"}
+		{"show_gpu_info", "Auto"},
+		{"intel_gpu_exporter", ""}
 	#endif
 	};
 	std::unordered_map<std::string_view, string> stringsTmp;

@@ -55,6 +55,8 @@ extern "C" {
 	#undef class
 #endif
 
+#include "./httplib.h"
+
 using std::clamp;
 using std::cmp_greater;
 using std::cmp_less;
@@ -224,6 +226,7 @@ namespace Gpu {
 	namespace Intel {
 		const char* device = "i915";
 		struct engines *engines = nullptr;
+		httplib::Client *exporter = nullptr;
 
 		bool initialized = false;
 		bool init();
@@ -1593,24 +1596,24 @@ namespace Gpu {
 	}
 
 	namespace Intel {
-		bool init() {
-			if (initialized) return false;
-
+		// Attempts to initialize with Intel PMU, returning the device name if successful
+		static char *init_pmu() {
 			char *gpu_path = find_intel_gpu_dir();
 			if (!gpu_path) {
 				Logger::debug("Failed to find Intel GPU sysfs path, Intel GPUs will not be detected");
-				return false;
+				return nullptr;
 			}
 
 			char *gpu_device_id = get_intel_device_id(gpu_path);
 			if (!gpu_device_id) {
 				Logger::debug("Failed to find Intel GPU device ID, Intel GPUs will not be detected");
-				return false;
+				return nullptr;
 			}
 
 			char *gpu_device_name = get_intel_device_name(gpu_device_id);
 			if (!gpu_device_name) {
 				Logger::warning("Failed to find Intel GPU device name in internal database");
+				gpu_device_name = strdup("Intel GPU");
 			}
 
 			free(gpu_device_id);
@@ -1618,28 +1621,110 @@ namespace Gpu {
 			engines = discover_engines(device);
 			if (!engines) {
 				Logger::debug("Failed to find Intel GPU engines, Intel GPUs will not be detected");
-				return false;
+				free(gpu_device_name);
+				return nullptr;
 			}
 
 			int ret = pmu_init(engines);
 			if (ret) {
 				Logger::warning("Intel GPU: Failed to initialize PMU");
-				return false;
+				free(gpu_device_name);
+				free_engines(engines);
+				engines = nullptr;
+				return nullptr;
 			}
 
-			pmu_sample(engines);
+			return gpu_device_name;
+		}
+
+		template<char T> std::vector<std::string> split_string(const std::string& str) {
+			auto result = std::vector<std::string>{};
+			auto ss = std::stringstream{str};
+
+			for (std::string line; std::getline(ss, line, T);)
+				result.push_back(line);
+
+			return result;
+		}
+
+		static std::string extract_exporter_field(const string& response_body, const string& field) {
+			auto lines = split_string<'\n'>(response_body);
+			for (const auto& line : lines) {
+				if (!line.length()) continue;
+				if (line[0] == '#') continue;
+
+				auto tokens = split_string<' '>(line);
+				if (tokens.size() != 2) continue;
+
+				if (tokens[0] != field) continue;
+				return tokens[1];
+			}
+			return "";
+		}
+
+		// Attempts to initialize with intel_gpu_exporter REST api
+		static char *init_rest() {
+			string rest_endpoint = Config::getS("intel_gpu_exporter");
+			if (rest_endpoint.empty()) {
+				Logger::debug("Fallback Intel GPU exporter not configured, Intel GPUs will not be detected");
+				return nullptr;
+			}
+
+			Logger::warning(rest_endpoint);
+
+			try {
+				exporter = new httplib::Client(rest_endpoint);
+
+				const auto response = exporter->Get("/").value();
+				Logger::warning(response.body);
+				string device_id = extract_exporter_field(response.body, "igpu_device_id");
+
+				if (device_id.empty()) {
+					Logger::warning("Failed to get Intel GPU device ID from exporter");
+					delete exporter;
+					exporter = nullptr;
+					return nullptr;
+				}
+
+				// We get the value as a float, so need to convert it to hex string
+				int device_id_i = (int)std::stod(device_id);
+				std::stringstream ss;
+				ss << std::hex << device_id_i;
+
+				char *gpu_device_name = get_intel_device_name(ss.str().c_str());
+				if (!gpu_device_name) {
+					Logger::warning("Failed to find Intel GPU device name in internal database");
+					gpu_device_name = strdup("Intel GPU");
+				}
+
+				return gpu_device_name;
+			} catch (const std::exception &e) {
+				Logger::warning("Failed to connect to Intel GPU exporter: "s + e.what());
+				if (exporter) delete exporter;
+				exporter = nullptr;
+				return nullptr;
+			}
+		}
+
+		bool init() {
+			if (initialized) return false;
+
+			char *gpu_device_name = init_pmu();
+			if (!gpu_device_name) {
+				gpu_device_name = init_rest();
+				if (!gpu_device_name) return false;
+			}
+
+			if (engines) {
+				pmu_sample(engines);
+			}
 
 			device_count = 1;
 
 			gpus.resize(gpus.size() + device_count);
 			gpu_names.resize(gpus.size() + device_count);
 
-			if (gpu_device_name) {
-				gpu_names[Nvml::device_count + Rsmi::device_count] = string(gpu_device_name);
-			} else {
-				gpu_names[Nvml::device_count + Rsmi::device_count] = "Intel GPU";
-			}
-
+			gpu_names[Nvml::device_count + Rsmi::device_count] = string(gpu_device_name);
 			free(gpu_device_name);
 
 			initialized = true;
@@ -1653,6 +1738,10 @@ namespace Gpu {
 			if (engines) {
 				free_engines(engines);
 				engines = nullptr;
+			}
+			if (exporter) {
+				delete exporter;
+				exporter = nullptr;
 			}
 			initialized = false;
 			return true;
@@ -1676,29 +1765,63 @@ namespace Gpu {
 				};
 			}
 
-			pmu_sample(engines);
-			double t = (double)(engines->ts.cur - engines->ts.prev) / 1e9;
+			if (engines) {
+				// local PMU sampling
 
-			double max_util = 0;
-			for (unsigned int i = 0; i < engines->num_engines; i++) {
-				struct engine *engine = &(&engines->engine)[i];
-				double util = pmu_calc(&engine->busy.val, 1e9, t, 100);
-				if (util > max_util) {
-					max_util = util;
+				pmu_sample(engines);
+				double t = (double)(engines->ts.cur - engines->ts.prev) / 1e9;
+
+				double max_util = 0;
+				for (unsigned int i = 0; i < engines->num_engines; i++) {
+					struct engine *engine = &(&engines->engine)[i];
+					double util = pmu_calc(&engine->busy.val, 1e9, t, 100);
+					if (util > max_util) {
+						max_util = util;
+					}
+				}
+				gpus_slice->gpu_percent.at("gpu-totals").push_back((long long)round(max_util));
+
+				double pwr = pmu_calc(&engines->r_gpu.val, 1, t, engines->r_gpu.scale); // in Watts
+				gpus_slice->pwr_usage = (long long)round(pwr * 1000);
+				if (gpus_slice->pwr_usage > 0) {
+					gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(100);
+				} else {
+					gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(0);
+				}
+
+				double freq = pmu_calc(&engines->freq_act.val, 1, t, 1); // in MHz
+				gpus_slice->gpu_clock_speed = (unsigned int)round(freq);
+			} else {
+				// remote REST sampling
+
+				try {
+					const auto response = exporter->Get("/").value();
+
+					string blitter_busy = extract_exporter_field(response.body, "igpu_engines_blitter_0_busy");
+					string render_3d_busy = extract_exporter_field(response.body, "igpu_engines_render_3d_0_busy");
+					string video_0_busy = extract_exporter_field(response.body, "igpu_engines_video_0_busy");
+					string video_enhance_0_busy = extract_exporter_field(response.body, "igpu_engines_video_enhance_0_busy");
+					string frequency_actual = extract_exporter_field(response.body, "igpu_frequency_actual");
+					string power_gpu = extract_exporter_field(response.body, "igpu_power_gpu");
+
+					double max_util = std::max({std::stod(blitter_busy), std::stod(render_3d_busy), std::stod(video_0_busy), std::stod(video_enhance_0_busy)});
+					gpus_slice->gpu_percent.at("gpu-totals").push_back((long long)round(max_util));
+
+					double pwr = std::stod(power_gpu);
+					gpus_slice->pwr_usage = (long long)round(pwr * 1000);
+					if (gpus_slice->pwr_usage > 0) {
+						gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(100);
+					} else {
+						gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(0);
+					}
+
+					double freq = std::stod(frequency_actual); // in MHz
+					gpus_slice->gpu_clock_speed = (unsigned int)round(freq);
+				} catch (const std::exception &e) {
+					Logger::warning("Failed to connect to Intel GPU exporter: "s + e.what());
+					return false;
 				}
 			}
-			gpus_slice->gpu_percent.at("gpu-totals").push_back((long long)round(max_util));
-
-			double pwr = pmu_calc(&engines->r_gpu.val, 1, t, engines->r_gpu.scale); // in Watts
-			gpus_slice->pwr_usage = (long long)round(pwr * 1000);
-			if (gpus_slice->pwr_usage > 0) {
-				gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(100);
-			} else {
-				gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(0);
-			}
-
-			double freq = pmu_calc(&engines->freq_act.val, 1, t, 1); // in MHz
-			gpus_slice->gpu_clock_speed = (unsigned int)round(freq);
 
 			return true;
 		}
