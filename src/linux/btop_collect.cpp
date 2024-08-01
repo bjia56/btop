@@ -1670,13 +1670,10 @@ namespace Gpu {
 				return nullptr;
 			}
 
-			Logger::warning(rest_endpoint);
-
 			try {
 				exporter = new httplib::Client(rest_endpoint);
 
 				const auto response = exporter->Get("/").value();
-				Logger::warning(response.body);
 				string device_id = extract_exporter_field(response.body, "igpu_device_id");
 
 				if (device_id.empty()) {
